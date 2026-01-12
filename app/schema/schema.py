@@ -1,19 +1,21 @@
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, field_validator
 from typing import List, Optional
 
 class Message(BaseModel):
     role: str    # "user" or "assistant"
     content: str
     
-    @validator('role')
+    @field_validator('role')
+    @classmethod
     def validate_role(cls, v):
         if v not in ["user", "assistant"]:
             raise ValueError('role must be "user" or "assistant"')
         return v
     
-    @validator('content')
+    @field_validator('content')
+    @classmethod
     def validate_content(cls, v):
         if not v or not v.strip():
             raise ValueError('content cannot be empty')
@@ -23,13 +25,15 @@ class AIRequest(BaseModel):
     messages: List[Message]
     user_id: str
     
-    @validator('messages')
+    @field_validator('messages')
+    @classmethod
     def validate_messages(cls, v):
         if not v:
             raise ValueError('messages list cannot be empty')
         return v
     
-    @validator('user_id')
+    @field_validator('user_id')
+    @classmethod
     def validate_user_id(cls, v):
         if not v or not v.strip():
             raise ValueError('user_id cannot be empty')
@@ -37,5 +41,5 @@ class AIRequest(BaseModel):
 
 class AIResponse(BaseModel):
     response: str
-    success: bool
-    error: Optional[str] = None
+    # success: bool
+    # error: Optional[str] = None

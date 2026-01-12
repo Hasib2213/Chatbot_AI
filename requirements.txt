@@ -2,4 +2,4 @@ fastapi
 uvicorn
 groq
 python-dotenv
-pydantic
+pydantic>=2.0
