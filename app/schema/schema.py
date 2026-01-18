@@ -43,6 +43,7 @@ class AIResponse(BaseModel):
     response: str
     success: bool = True
     error: Optional[str] = None
+    thread_id: Optional[str] = None  # Add thread_id to response
 
 class SummaryRequest(BaseModel):
     thread_id: str
@@ -90,8 +91,8 @@ class ContextAwareChatRequest(BaseModel):
     """Chat request with optional thread_id for context-aware responses"""
     messages: List[Message]
     user_id: str
-    thread_id: Optional[str] = None  # Optional: auto-generated if not provided
-
+    thread_id: Optional[str] = None
+    
 class ThreadMessagesRequest(BaseModel):
     """Combined request for thread messages (fetch mode) or chat (chat mode)"""
     messages: Optional[List[Message]] = None  # If provided: chat mode, else: fetch mode

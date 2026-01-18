@@ -233,23 +233,29 @@ async def generate_context_aware_response(messages: List[dict], thread_id: str, 
         # Fetch thread summary from database for context
         from app.database import db_client
         
-        context_text = ""
+        context_parts = []
+        
         if db_client and db_client.is_connected():
+            # Get thread summary if exists
             thread_summary = db_client.get_thread_summary(thread_id)
             if thread_summary:
                 logger.info(f"Using stored summary for thread {thread_id}")
-                context_text = f"\n\n=== THREAD SUMMARY ===\n{thread_summary}\n=== END OF SUMMARY ===\n\n"
+                context_parts.append(f"[SUMMARY: {thread_summary}]")
         
-        # Also fetch recent messages for context
+        # Also fetch recent messages for context - ALWAYS include them
         thread_history = await get_thread_messages(thread_id, user_id, limit=20)
         
-        # Build context from thread history (if no summary exists)
-        if not context_text and thread_history and len(thread_history) > 0:
+        if thread_history and len(thread_history) > 0:
             logger.info(f"Found {len(thread_history)} previous messages for context")
-            context_text = "\n\n=== PREVIOUS CONVERSATION CONTEXT ===\n"
-            for msg in thread_history[-10:]:  # Last 10 for context
-                context_text += f"{msg.get('role', 'user').upper()}: {msg.get('content', '')}\n"
-            context_text += "=== END OF CONTEXT ===\n\n"
+            # Include more messages for better context
+            recent_msgs = " | ".join([
+                f"{msg.get('role', 'user')[0].upper()}:{msg.get('content', '')[:40]}"
+                for msg in thread_history[-10:]  # Last 10 messages
+            ])
+            context_parts.append(f"[HISTORY: {recent_msgs}]")
+        
+        # Combine all context
+        context_text = " ".join(context_parts) if context_parts else ""
         
         # Prepare messages with context
         formatted_messages = [

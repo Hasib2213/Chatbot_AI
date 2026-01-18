@@ -7,11 +7,13 @@ from app.schema.schema import (
     ContextAwareChatRequest, ThreadListResponse, ThreadDeleteResponse, ThreadInfo,
     ThreadMessagesRequest
 )
+from fastapi.middleware.cors import CORSMiddleware
 from app.database import db_client
 from config import settings
 import logging
 from datetime import datetime
 import asyncio
+import uuid
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,9 +21,17 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI assistant")
 
+app.add_middleware(
+   CORSMiddleware,
+  allow_origins=["*"],  # Configure appropriately for production
+  allow_credentials=True,
+    allow_methods=["*"],
+   allow_headers=["*"],
+)
+
 
 async def auto_generate_summary(thread_id: str, user_id: str):
-    """Auto-generate summary if message count reaches multiple of 10"""
+    """Auto-generate summary when thread has 10+ messages (counting pairs)"""
     try:
         if not db_client or not db_client.is_connected():
             return
@@ -29,8 +39,12 @@ async def auto_generate_summary(thread_id: str, user_id: str):
         # Get current message count
         message_count = db_client.messages_collection.count_documents({"thread_id": thread_id})
         
-        # Generate summary every 10 messages
-        if message_count > 0 and message_count % 10 == 0:
+        # Get thread info to check if summary already exists
+        thread_info = db_client.get_thread_info(thread_id)
+        has_summary = thread_info.get("summary") if thread_info else None
+        
+        # Generate summary every 10 messages (if not already generated)
+        if message_count >= 10 and message_count % 10 == 0 and not has_summary:
             logger.info(f"Auto-generating summary for thread {thread_id} at {message_count} messages")
             try:
                 summary_text = await generate_summary(thread_id, user_id)
@@ -53,13 +67,14 @@ async def generate(request: AIRequest):
         
         messages = [msg.model_dump() for msg in request.messages]
         
-        logger.info(f"Generating response for user {request.user_id}")
-        response_text = await generate_gemini_response(messages, request.user_id)
+        # Generate unique thread_id for each new conversation
+        thread_id = str(uuid.uuid4())
+        
+        logger.info(f"Generating response for user {request.user_id} with thread {thread_id}")
         
         # Save user message to database
         if messages and db_client and db_client.is_connected():
             user_message = messages[-1]  # Last message from user
-            thread_id = f"thread_{request.user_id}"  # Auto-generate thread ID
             
             # Create thread if it doesn't exist
             if not db_client.get_thread_info(thread_id):
@@ -69,12 +84,22 @@ async def generate(request: AIRequest):
                 db_client.create_thread(thread_id, request.user_id, title=title)
             
             db_client.save_message(thread_id, request.user_id, user_message.get("role", "user"), user_message.get("content", ""))
+            
+            # Use context-aware response to preserve conversation history
+            response_text = await generate_context_aware_response(messages, thread_id, request.user_id)
+            
             db_client.save_message(thread_id, request.user_id, "assistant", response_text)
             db_client.update_thread_message_count(thread_id)
             logger.info(f"Messages saved to database for thread {thread_id}")
             
             # Auto-generate summary in background (non-blocking)
             asyncio.create_task(auto_generate_summary(thread_id, request.user_id))
+            
+            return AIResponse(response=response_text, success=True, thread_id=thread_id)
+        else:
+            # Fallback if no database - use basic response
+            response_text = await generate_gemini_response(messages, request.user_id)
+            return AIResponse(response=response_text, success=True, thread_id=thread_id)
         
         return AIResponse(response=response_text, success=True)
     
@@ -85,106 +110,7 @@ async def generate(request: AIRequest):
         logger.error(f"Error generating response: {str(e)}")
         return AIResponse(response="", success=False, error=f"Error: {str(e)}")
 
-@app.post("/api/summarize", response_model=SummaryResponse)
-async def summarize_thread(request: SummaryRequest):
-    """
-    Generate a summary of the last 10 messages in a thread.
-    
-    Args:
-        request: SummaryRequest containing thread_id and user_id
-        
-    Returns:
-        SummaryResponse with the generated summary
-    """
-    try:
-        # Validate API key
-        if not settings.GROQ_API_KEY:
-            logger.error("GROQ_API_KEY is not set")
-            raise ValueError("API key is not configured")
-        
-        logger.info(f"Generating summary for thread {request.thread_id}, user {request.user_id}")
-        summary_text = await generate_summary(request.thread_id, request.user_id)
-        
-        # Save summary to database
-        if db_client and db_client.is_connected():
-            db_client.save_thread_summary(request.thread_id, summary_text)
-            logger.info(f"Summary saved to database for thread {request.thread_id}")
-        
-        return SummaryResponse(
-            summary=summary_text,
-            thread_id=request.thread_id,
-            success=True
-        )
-    
-    except ValueError as e:
-        logger.warning(f"Validation error: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error generating summary: {str(e)}")
-        return SummaryResponse(
-            summary="",
-            thread_id=request.thread_id,
-            success=False,
-            error=f"Error: {str(e)}"
-        )
 
-@app.post("/api/chat-context", response_model=AIResponse)
-async def chat_with_context(request: ContextAwareChatRequest):
-    """
-    Chat with context awareness. If thread_id provided, it reads thread summary 
-    and provides context-aware responses.
-    
-    Args:
-        request: Chat request with optional thread_id
-        
-    Returns:
-        AIResponse with context-aware response
-    """
-    try:
-        if not settings.GROQ_API_KEY:
-            logger.error("GROQ_API_KEY is not set")
-            raise ValueError("API key is not configured")
-        
-        # Auto-generate thread_id if not provided
-        thread_id = request.thread_id or f"thread_{request.user_id}"
-        
-        messages = [msg.model_dump() for msg in request.messages]
-        
-        logger.info(f"Generating context-aware response for thread {thread_id}, user {request.user_id}")
-        
-        # Generate response with thread context
-        response_text = await generate_context_aware_response(
-            messages, 
-            thread_id, 
-            request.user_id
-        )
-        
-        # Save messages to database
-        if messages and db_client and db_client.is_connected():
-            # Create thread if it doesn't exist
-            if not db_client.get_thread_info(thread_id):
-                # Generate title from message content (first 50 chars)
-                msg_content = messages[-1].get("content", "")
-                title = msg_content[:50] + "..." if len(msg_content) > 50 else msg_content
-                db_client.create_thread(thread_id, request.user_id, title=title)
-            
-            user_message = messages[-1]
-            db_client.save_message(thread_id, request.user_id, user_message.get("role", "user"), user_message.get("content", ""))
-            db_client.save_message(thread_id, request.user_id, "assistant", response_text)
-            db_client.update_thread_message_count(thread_id)
-            logger.info(f"Messages saved to thread {thread_id}")
-            
-            # Auto-generate summary in background (non-blocking)
-            asyncio.create_task(auto_generate_summary(thread_id, request.user_id))
-        
-        return AIResponse(response=response_text, success=True)
-    
-    except ValueError as e:
-        logger.warning(f"Validation error: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error generating context-aware response: {str(e)}")
-        return AIResponse(response="", success=False, error=f"Error: {str(e)}")
 
 @app.get("/api/threads/{user_id}", response_model=ThreadListResponse)
 async def get_user_threads(user_id: str):
@@ -378,3 +304,5 @@ async def thread_messages_combined(
     except Exception as e:
         logger.error(f"Error in thread_messages_combined: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+    
+    
