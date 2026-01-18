@@ -230,12 +230,21 @@ async def generate_context_aware_response(messages: List[dict], thread_id: str, 
         if not messages:
             raise ValueError("Messages list cannot be empty")
         
-        # Fetch thread history for context
+        # Fetch thread summary from database for context
+        from app.database import db_client
+        
+        context_text = ""
+        if db_client and db_client.is_connected():
+            thread_summary = db_client.get_thread_summary(thread_id)
+            if thread_summary:
+                logger.info(f"Using stored summary for thread {thread_id}")
+                context_text = f"\n\n=== THREAD SUMMARY ===\n{thread_summary}\n=== END OF SUMMARY ===\n\n"
+        
+        # Also fetch recent messages for context
         thread_history = await get_thread_messages(thread_id, user_id, limit=20)
         
-        # Build context from thread history
-        context_text = ""
-        if thread_history and len(thread_history) > 0:
+        # Build context from thread history (if no summary exists)
+        if not context_text and thread_history and len(thread_history) > 0:
             logger.info(f"Found {len(thread_history)} previous messages for context")
             context_text = "\n\n=== PREVIOUS CONVERSATION CONTEXT ===\n"
             for msg in thread_history[-10:]:  # Last 10 for context

@@ -181,6 +181,46 @@ class MongoDBClient:
             logger.error(f"Error retrieving thread info: {str(e)}")
             return None
     
+    def save_thread_summary(self, thread_id: str, summary: str) -> bool:
+        """Save or update thread summary in database"""
+        if not self.is_connected():
+            logger.error("Threads collection is not available")
+            return False
+        
+        try:
+            self.threads_collection.update_one(
+                {"thread_id": thread_id},
+                {
+                    "$set": {
+                        "summary": summary,
+                        "summary_updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            logger.info(f"Summary saved for thread {thread_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving thread summary: {str(e)}")
+            return False
+    
+    def get_thread_summary(self, thread_id: str) -> Optional[str]:
+        """Get thread summary from database"""
+        if not self.is_connected():
+            logger.error("Threads collection is not available")
+            return None
+        
+        try:
+            thread = self.threads_collection.find_one({"thread_id": thread_id})
+            if thread:
+                summary = thread.get("summary")
+                if summary:
+                    logger.info(f"Retrieved summary for thread {thread_id}")
+                    return summary
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving thread summary: {str(e)}")
+            return None
+    
     def close_connection(self):
         """Close MongoDB connection"""
         if self.client:

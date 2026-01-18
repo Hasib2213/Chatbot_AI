@@ -221,7 +221,7 @@ SUMMARIZATION RULES:
 3. Extract key points: What are the important details discussed?
 4. Summarize the content ONLY - do not add your own opinions or information.
 5. Keep the summary brief, clear, and factual.
-6. Use the same language as the conversation (Bengali for Bengali, English for English, etc.).
+6. Use the same language as the conversation (Bengali for Bengali, Italian for Italian, English for English, etc.).
 
 OUTPUT FORMAT:
 Topic: [What is the conversation about?]

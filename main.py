@@ -4,18 +4,43 @@ from typing import List, Optional
 from app.LLM_Service.ai_service import generate_gemini_response, generate_summary, generate_context_aware_response
 from app.schema.schema import (
     AIRequest, AIResponse, SummaryRequest, SummaryResponse,
-    ContextAwareChatRequest, ThreadListResponse, ThreadDeleteResponse, ThreadInfo
+    ContextAwareChatRequest, ThreadListResponse, ThreadDeleteResponse, ThreadInfo,
+    ThreadMessagesRequest
 )
 from app.database import db_client
 from config import settings
 import logging
 from datetime import datetime
+import asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI assistant")
+
+
+async def auto_generate_summary(thread_id: str, user_id: str):
+    """Auto-generate summary if message count reaches multiple of 10"""
+    try:
+        if not db_client or not db_client.is_connected():
+            return
+        
+        # Get current message count
+        message_count = db_client.messages_collection.count_documents({"thread_id": thread_id})
+        
+        # Generate summary every 10 messages
+        if message_count > 0 and message_count % 10 == 0:
+            logger.info(f"Auto-generating summary for thread {thread_id} at {message_count} messages")
+            try:
+                summary_text = await generate_summary(thread_id, user_id)
+                if summary_text:
+                    db_client.save_thread_summary(thread_id, summary_text)
+                    logger.info(f"Auto-summary generated and saved for thread {thread_id}")
+            except Exception as e:
+                logger.error(f"Error auto-generating summary: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error in auto_generate_summary: {str(e)}")
 
 
 @app.post("/api/chat", response_model=AIResponse)
@@ -38,12 +63,18 @@ async def generate(request: AIRequest):
             
             # Create thread if it doesn't exist
             if not db_client.get_thread_info(thread_id):
-                db_client.create_thread(thread_id, request.user_id, title=f"Chat with {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+                # Generate title from message content (first 50 chars)
+                msg_content = user_message.get("content", "")
+                title = msg_content[:50] + "..." if len(msg_content) > 50 else msg_content
+                db_client.create_thread(thread_id, request.user_id, title=title)
             
             db_client.save_message(thread_id, request.user_id, user_message.get("role", "user"), user_message.get("content", ""))
             db_client.save_message(thread_id, request.user_id, "assistant", response_text)
             db_client.update_thread_message_count(thread_id)
             logger.info(f"Messages saved to database for thread {thread_id}")
+            
+            # Auto-generate summary in background (non-blocking)
+            asyncio.create_task(auto_generate_summary(thread_id, request.user_id))
         
         return AIResponse(response=response_text, success=True)
     
@@ -73,6 +104,11 @@ async def summarize_thread(request: SummaryRequest):
         
         logger.info(f"Generating summary for thread {request.thread_id}, user {request.user_id}")
         summary_text = await generate_summary(request.thread_id, request.user_id)
+        
+        # Save summary to database
+        if db_client and db_client.is_connected():
+            db_client.save_thread_summary(request.thread_id, summary_text)
+            logger.info(f"Summary saved to database for thread {request.thread_id}")
         
         return SummaryResponse(
             summary=summary_text,
@@ -127,13 +163,19 @@ async def chat_with_context(request: ContextAwareChatRequest):
         if messages and db_client and db_client.is_connected():
             # Create thread if it doesn't exist
             if not db_client.get_thread_info(thread_id):
-                db_client.create_thread(thread_id, request.user_id, title=f"Chat with {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+                # Generate title from message content (first 50 chars)
+                msg_content = messages[-1].get("content", "")
+                title = msg_content[:50] + "..." if len(msg_content) > 50 else msg_content
+                db_client.create_thread(thread_id, request.user_id, title=title)
             
             user_message = messages[-1]
             db_client.save_message(thread_id, request.user_id, user_message.get("role", "user"), user_message.get("content", ""))
             db_client.save_message(thread_id, request.user_id, "assistant", response_text)
             db_client.update_thread_message_count(thread_id)
             logger.info(f"Messages saved to thread {thread_id}")
+            
+            # Auto-generate summary in background (non-blocking)
+            asyncio.create_task(auto_generate_summary(thread_id, request.user_id))
         
         return AIResponse(response=response_text, success=True)
     
@@ -238,9 +280,101 @@ async def get_thread_all_messages(thread_id: str, user_id: str):
             "user_id": user_id,
             "messages": messages,
             "count": len(messages),
-            "success": True
+            
         }
     
     except Exception as e:
         logger.error(f"Error retrieving thread messages: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.post("/api/threads/{thread_id}/{user_id}/messages")
+async def thread_messages_combined(
+    thread_id: str, 
+    user_id: str,
+    request: ThreadMessagesRequest
+):
+    """
+    Combined endpoint for GET/CHAT operations:
+    - If 'messages' provided: Chat mode (generate response + save to thread + use summary context)
+    - If 'messages' NOT provided: Fetch mode (retrieve messages + summary from thread)
+    """
+    try:
+        if not db_client or not db_client.is_connected():
+            raise ValueError("Database not connected")
+        
+        # CHAT MODE: If messages provided
+        if request.messages and len(request.messages) > 0:
+            if not settings.GROQ_API_KEY:
+                logger.error("GROQ_API_KEY is not set")
+                raise ValueError("API key is not configured")
+            
+            messages_list = [msg.model_dump() for msg in request.messages]
+            
+            logger.info(f"Chat mode: Generating context-aware response for thread {thread_id}, user {user_id}")
+            
+            # Generate response with thread context (uses stored summary)
+            response_text = await generate_context_aware_response(
+                messages_list, 
+                thread_id, 
+                user_id
+            )
+            
+            # Save messages to database
+            if db_client and db_client.is_connected():
+                # Create thread if it doesn't exist
+                if not db_client.get_thread_info(thread_id):
+                    msg_content = messages_list[-1].get("content", "")
+                    title = msg_content[:50] + "..." if len(msg_content) > 50 else msg_content
+                    db_client.create_thread(thread_id, user_id, title=title)
+                
+                user_message = messages_list[-1]
+                db_client.save_message(thread_id, user_id, user_message.get("role", "user"), user_message.get("content", ""))
+                db_client.save_message(thread_id, user_id, "assistant", response_text)
+                db_client.update_thread_message_count(thread_id)
+                logger.info(f"Messages saved to thread {thread_id}")
+                
+                # Auto-generate summary in background
+                asyncio.create_task(auto_generate_summary(thread_id, user_id))
+            
+            # Get updated summary
+            thread_info = db_client.get_thread_info(thread_id)
+            thread_summary = thread_info.get("summary") if thread_info else None
+            
+            return {
+                "thread_id": thread_id,
+                "user_id": user_id,
+                "response": response_text,
+               
+            }
+        
+        # FETCH MODE: If messages NOT provided
+        else:
+            logger.info(f"Fetch mode: Retrieving messages from thread {thread_id}, user {user_id}")
+            
+            # message_limit = request.limit or 100
+            
+            # Get messages from thread
+            messages_list = db_client.get_thread_messages(thread_id, user_id, limit=message_limit)
+            
+            # Get thread summary for context
+            thread_summary = None
+            thread_info = db_client.get_thread_info(thread_id)
+            if thread_info:
+                thread_summary = thread_info.get("summary")
+            
+            logger.info(f"Retrieved {len(messages_list)} messages from thread {thread_id}")
+            
+            return {
+                "thread_id": thread_id,
+                "user_id": user_id,
+                "messages": messages_list,
+                "count": len(messages_list),
+                
+            }
+    
+    except ValueError as e:
+        logger.warning(f"Validation error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error in thread_messages_combined: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
