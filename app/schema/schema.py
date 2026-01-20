@@ -96,4 +96,4 @@ class ContextAwareChatRequest(BaseModel):
 class ThreadMessagesRequest(BaseModel):
     """Combined request for thread messages (fetch mode) or chat (chat mode)"""
     messages: Optional[List[Message]] = None  # If provided: chat mode, else: fetch mode
-    # limit: Optional[int] = None  # For fetch mode: max messages to retrieve
+ 
