@@ -3,6 +3,7 @@ from config import settings
 from app.prompts.system_prompt import SYSTEM_PROMPT, SUMMARY_PROMPT
 from typing import List, Dict
 import logging
+import asyncio
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -54,7 +55,9 @@ class GroqService:
 
             # Groq API call
             logger.info(f"Calling Groq API with {len(formatted_messages)} messages for user {user_id}")
-            response = self.client.chat.completions.create(
+            # Offload blocking Groq API call to a thread to avoid blocking the event loop
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
                 model=self.model_name,
                 messages=formatted_messages,
                 temperature=settings.TEMPERATURE,
@@ -185,7 +188,9 @@ Conversation:
         logger.info(f"Generating summary for thread {thread_id}, user {user_id}")
         
         # Call Groq API for summary
-        response = groq_service.client.chat.completions.create(
+        # Offload blocking Groq API call to a thread
+        response = await asyncio.to_thread(
+            groq_service.client.chat.completions.create,
             model=groq_service.model_name,
             messages=formatted_messages,
             temperature=0.3,  # Lower temperature for more consistent summaries
@@ -277,7 +282,9 @@ async def generate_context_aware_response(messages: List[dict], thread_id: str, 
         logger.info(f"Calling Groq API with context for thread {thread_id}, user {user_id}")
         
         # Call Groq API
-        response = groq_service.client.chat.completions.create(
+        # Offload blocking Groq API call to a thread
+        response = await asyncio.to_thread(
+            groq_service.client.chat.completions.create,
             model=groq_service.model_name,
             messages=formatted_messages,
             temperature=settings.TEMPERATURE,

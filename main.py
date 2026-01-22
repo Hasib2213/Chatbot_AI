@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from typing import List, Optional
 from app.LLM_Service.ai_service import generate_gemini_response, generate_summary, generate_context_aware_response
@@ -14,6 +14,7 @@ import logging
 from datetime import datetime
 import asyncio
 import uuid
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,10 +38,13 @@ async def auto_generate_summary(thread_id: str, user_id: str):
             return
         
         # Get current message count
-        message_count = db_client.messages_collection.count_documents({"thread_id": thread_id})
+        message_count = await asyncio.to_thread(
+            db_client.messages_collection.count_documents,
+            {"thread_id": thread_id}
+        )
         
         # Get thread info to check if summary already exists
-        thread_info = db_client.get_thread_info(thread_id)
+        thread_info = await asyncio.to_thread(db_client.get_thread_info, thread_id)
         has_summary = thread_info.get("summary") if thread_info else None
         
         # Generate summary every 10 messages (if not already generated)
@@ -49,7 +53,7 @@ async def auto_generate_summary(thread_id: str, user_id: str):
             try:
                 summary_text = await generate_summary(thread_id, user_id)
                 if summary_text:
-                    db_client.save_thread_summary(thread_id, summary_text)
+                    await asyncio.to_thread(db_client.save_thread_summary, thread_id, summary_text)
                     logger.info(f"Auto-summary generated and saved for thread {thread_id}")
             except Exception as e:
                 logger.error(f"Error auto-generating summary: {str(e)}")
@@ -77,19 +81,25 @@ async def generate(request: AIRequest):
             user_message = messages[-1]  # Last message from user
             
             # Create thread if it doesn't exist
-            if not db_client.get_thread_info(thread_id):
+            if not await asyncio.to_thread(db_client.get_thread_info, thread_id):
                 # Generate title from message content (first 50 chars)
                 msg_content = user_message.get("content", "")
                 title = msg_content[:50] + "..." if len(msg_content) > 50 else msg_content
-                db_client.create_thread(thread_id, request.user_id, title=title)
+                await asyncio.to_thread(db_client.create_thread, thread_id, request.user_id, title)
             
-            db_client.save_message(thread_id, request.user_id, user_message.get("role", "user"), user_message.get("content", ""))
+            await asyncio.to_thread(
+                db_client.save_message,
+                thread_id,
+                request.user_id,
+                user_message.get("role", "user"),
+                user_message.get("content", "")
+            )
             
             # Use context-aware response to preserve conversation history
             response_text = await generate_context_aware_response(messages, thread_id, request.user_id)
             
-            db_client.save_message(thread_id, request.user_id, "assistant", response_text)
-            db_client.update_thread_message_count(thread_id)
+            await asyncio.to_thread(db_client.save_message, thread_id, request.user_id, "assistant", response_text)
+            await asyncio.to_thread(db_client.update_thread_message_count, thread_id)
             logger.info(f"Messages saved to database for thread {thread_id}")
             
             # Auto-generate summary in background (non-blocking)
@@ -248,22 +258,22 @@ async def thread_messages_combined(
             # Save messages to database
             if db_client and db_client.is_connected():
                 # Create thread if it doesn't exist
-                if not db_client.get_thread_info(thread_id):
+                if not await asyncio.to_thread(db_client.get_thread_info, thread_id):
                     msg_content = messages_list[-1].get("content", "")
                     title = msg_content[:50] + "..." if len(msg_content) > 50 else msg_content
-                    db_client.create_thread(thread_id, user_id, title=title)
+                    await asyncio.to_thread(db_client.create_thread, thread_id, user_id, title)
                 
                 user_message = messages_list[-1]
-                db_client.save_message(thread_id, user_id, user_message.get("role", "user"), user_message.get("content", ""))
-                db_client.save_message(thread_id, user_id, "assistant", response_text)
-                db_client.update_thread_message_count(thread_id)
+                await asyncio.to_thread(db_client.save_message, thread_id, user_id, user_message.get("role", "user"), user_message.get("content", ""))
+                await asyncio.to_thread(db_client.save_message, thread_id, user_id, "assistant", response_text)
+                await asyncio.to_thread(db_client.update_thread_message_count, thread_id)
                 logger.info(f"Messages saved to thread {thread_id}")
                 
                 # Auto-generate summary in background
                 asyncio.create_task(auto_generate_summary(thread_id, user_id))
             
             # Get updated summary
-            thread_info = db_client.get_thread_info(thread_id)
+            thread_info = await asyncio.to_thread(db_client.get_thread_info, thread_id)
             thread_summary = thread_info.get("summary") if thread_info else None
             
             return {
@@ -280,11 +290,11 @@ async def thread_messages_combined(
           
             
             # Get messages from thread
-            messages_list = db_client.get_thread_messages(thread_id, user_id)
+            messages_list = await asyncio.to_thread(db_client.get_thread_messages, thread_id, user_id)
             
             # Get thread summary for context
             thread_summary = None
-            thread_info = db_client.get_thread_info(thread_id)
+            thread_info = await asyncio.to_thread(db_client.get_thread_info, thread_id)
             if thread_info:
                 thread_summary = thread_info.get("summary")
             
@@ -304,5 +314,172 @@ async def thread_messages_combined(
     except Exception as e:
         logger.error(f"Error in thread_messages_combined: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+@app.websocket("/ws/chat/{thread_id}/{user_id}")
+async def websocket_chat(websocket: WebSocket, thread_id: str, user_id: str):
+    """
+    WebSocket endpoint for real-time chat
     
+    Expected client message format:
+    {
+        "type": "message",
+        "content": "user message content",
+        "role": "user"
+    }
     
+    Server response format:
+    {
+        "type": "response",
+        "content": "assistant response",
+        "role": "assistant",
+        "thread_id": "thread_id",
+        "success": true
+    }
+    """
+    await websocket.accept()
+    logger.info(f"WebSocket connection established for thread {thread_id}, user {user_id}")
+    
+    try:
+        # Validate API key
+        if not settings.GROQ_API_KEY:
+            await websocket.send_json({
+                "type": "error",
+                "content": "API key is not configured",
+                "success": False
+            })
+            await websocket.close()
+            return
+        
+        # Check database connection
+        if not db_client or not db_client.is_connected():
+            await websocket.send_json({
+                "type": "error",
+                "content": "Database not connected",
+                "success": False
+            })
+            await websocket.close()
+            return
+        
+        # Create thread if it doesn't exist
+        if not await asyncio.to_thread(db_client.get_thread_info, thread_id):
+            await asyncio.to_thread(db_client.create_thread, thread_id, user_id, "WebSocket Chat")
+            logger.info(f"Created new thread {thread_id} for WebSocket connection")
+        
+        # Send connection confirmation
+        await websocket.send_json({
+            "type": "connected",
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "success": True
+        })
+        
+        while True:
+            # Receive message from client
+            data = await websocket.receive_text()
+            
+            try:
+                message_data = json.loads(data)
+                
+                # Validate message format
+                if not isinstance(message_data, dict) or "content" not in message_data:
+                    await websocket.send_json({
+                        "type": "error",
+                        "content": "Invalid message format. Expected JSON with 'content' field.",
+                        "success": False
+                    })
+                    continue
+                
+                user_content = message_data.get("content", "").strip()
+                if not user_content:
+                    await websocket.send_json({
+                        "type": "error",
+                        "content": "Message content cannot be empty",
+                        "success": False
+                    })
+                    continue
+                
+                logger.info(f"Received WebSocket message from user {user_id} in thread {thread_id}")
+                
+                # Save user message to database
+                await asyncio.to_thread(db_client.save_message, thread_id, user_id, "user", user_content)
+                
+                # Get conversation history for context
+                history_messages = await asyncio.to_thread(db_client.get_thread_messages, thread_id, user_id, 20)
+                
+                # Format messages for AI
+                formatted_messages = [
+                    {"role": msg["role"], "content": msg["content"]}
+                    for msg in history_messages
+                ]
+                
+                # Send typing indicator
+                await websocket.send_json({
+                    "type": "typing",
+                    "success": True
+                })
+                
+                # Generate AI response
+                response_text = await generate_context_aware_response(
+                    formatted_messages,
+                    thread_id,
+                    user_id
+                )
+                
+                # Save assistant response to database
+                await asyncio.to_thread(db_client.save_message, thread_id, user_id, "assistant", response_text)
+                await asyncio.to_thread(db_client.update_thread_message_count, thread_id)
+                
+                # Send response to client
+                await websocket.send_json({
+                    "type": "response",
+                    "content": response_text,
+                    "role": "assistant",
+                    "thread_id": thread_id,
+                    "success": True
+                })
+                
+                logger.info(f"WebSocket response sent for thread {thread_id}")
+                
+                # Auto-generate summary in background (non-blocking)
+                asyncio.create_task(auto_generate_summary(thread_id, user_id))
+                
+            except json.JSONDecodeError:
+                await websocket.send_json({
+                    "type": "error",
+                    "content": "Invalid JSON format",
+                    "success": False
+                })
+            except Exception as e:
+                logger.error(f"Error processing WebSocket message: {str(e)}")
+                await websocket.send_json({
+                    "type": "error",
+                    "content": f"Error processing message: {str(e)}",
+                    "success": False
+                })
+    
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for thread {thread_id}, user {user_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {str(e)}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "content": f"Connection error: {str(e)}",
+                "success": False
+            })
+        except:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
+        logger.info(f"WebSocket connection closed for thread {thread_id}, user {user_id}")
+
+    
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000)
