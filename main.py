@@ -479,6 +479,13 @@ async def websocket_chat(websocket: WebSocket, thread_id: str, user_id: str):
 
     
 
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the AI Assistant API. Visit /docs for API documentation.",
+            "status": "running",
+            'websocket_endpoint_example': "ws://localhost:8000/ws/chat/{thread_id}/{user_id}"}
+
+
 
 if __name__ == "__main__":
     import uvicorn
