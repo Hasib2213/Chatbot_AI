@@ -302,3 +302,8 @@ async def generate_context_aware_response(messages: List[dict], thread_id: str, 
     except Exception as e:
         logger.error(f"Error generating context-aware response: {str(e)}")
         raise
+
+
+
+
+

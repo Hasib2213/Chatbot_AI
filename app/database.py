@@ -20,7 +20,8 @@ class MongoDBClient:
             logger.info("Connected to MongoDB successfully")
             
             self.db = self.client[settings.DATABASE_NAME]
-            self.messages_collection = self.db['messages']
+            # Use new collection name for storing chat messages
+            self.messages_collection = self.db['AI_Chat_messages']
             self.threads_collection = self.db['threads']
             
             # Create indexes for better performance
